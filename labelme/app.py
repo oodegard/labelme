@@ -885,6 +885,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._docks.flag_dock.toggleViewAction(),
                 self._docks.label_dock.toggleViewAction(),
                 self._docks.shape_dock.toggleViewAction(),
+                self._docks.channel_dock.toggleViewAction(),
                 self._docks.file_dock.toggleViewAction(),
                 None,
                 self._actions.reset_layout,
@@ -1017,7 +1018,7 @@ class MainWindow(QtWidgets.QMainWindow):
         #
         # Bump this when dock/toolbar layout changes to reset window state
         # for users upgrading from an older version.
-        SETTINGS_VERSION: int = 1
+        SETTINGS_VERSION: int = 2
         if self.settings.value("settingsVersion", 0, type=int) != SETTINGS_VERSION:
             self._reset_layout()
             self.settings.setValue("settingsVersion", SETTINGS_VERSION)
@@ -1223,8 +1224,8 @@ class MainWindow(QtWidgets.QMainWindow):
         channel_list = QtWidgets.QListWidget()
         channel_list.itemChanged.connect(self._on_channel_item_changed)
 
-        channel = QtWidgets.QDockWidget(self.tr("Channels"), self)
-        channel.setObjectName("Channels")
+        channel = QtWidgets.QDockWidget(self.tr("Channel List"), self)
+        channel.setObjectName("Channel List")
         channel.setWidget(channel_list)
         channel.setVisible(False)
 
@@ -1269,6 +1270,7 @@ class MainWindow(QtWidgets.QMainWindow):
             channel_features = channel_features | QtWidgets.QDockWidget.DockWidgetMovable
         channel.setFeatures(channel_features)
         self.addDockWidget(Qt.RightDockWidgetArea, channel)
+        self.splitDockWidget(shape, channel, Qt.Vertical)
         self.splitDockWidget(channel, file, Qt.Vertical)
 
         return _DockWidgets(
@@ -3029,6 +3031,25 @@ class MainWindow(QtWidgets.QMainWindow):
         stats: list[str] = []
         stats.append(f"mode={self._canvas_widgets.canvas.mode.name}")
         stats.append(f"x={mouse_pos.x():6.1f}, y={mouse_pos.y():6.1f}")
+        
+        # Add pixel intensity value if image data is available
+        if hasattr(self, 'imageData') and self.imageData is not None:
+            import numpy as np
+            x_pixel = int(mouse_pos.x())
+            y_pixel = int(mouse_pos.y())
+            
+            # Check if coordinates are within image bounds
+            if 0 <= y_pixel < self.imageData.shape[0] and 0 <= x_pixel < self.imageData.shape[1]:
+                pixel_val = self.imageData[y_pixel, x_pixel]
+                
+                # Handle multi-channel images - average or use first channel
+                if isinstance(pixel_val, np.ndarray) and pixel_val.ndim > 0:
+                    pixel_val = int(np.mean(pixel_val))
+                else:
+                    pixel_val = int(pixel_val)
+                
+                stats.append(f"v={pixel_val}")
+        
         self._status_bar.stats.setText(" | ".join(stats))
 
 

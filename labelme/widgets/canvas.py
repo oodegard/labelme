@@ -391,6 +391,11 @@ class Canvas(QtWidgets.QWidget):
 
         # Polygon drawing.
         if self.drawing():
+            if self.createMode == "point_mask":
+                self.overrideCursor(CURSOR_DRAW)
+                self.repaint()  # draw crosshair
+                self._update_status()
+                return
             if self.createMode in ["ai_polygon", "ai_mask"]:
                 self.line.shape_type = "points"
             else:
