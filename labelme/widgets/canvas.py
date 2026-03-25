@@ -15,6 +15,7 @@ from PyQt5.QtCore import QPointF
 from PyQt5.QtCore import Qt
 
 import labelme.utils
+from labelme._automation import MicroSamSession
 from labelme._automation import OsamSession
 from labelme._automation import polygon_from_mask
 from labelme.shape import Shape
@@ -28,6 +29,13 @@ CURSOR_MOVE = Qt.ClosedHandCursor
 CURSOR_GRAB = Qt.OpenHandCursor
 
 MOVE_SPEED: float = 5.0
+
+FRAME_TIME_KEY = "frame_time_index"
+FRAME_Z_KEY = "frame_z_index"
+
+# Backward-compatible aliases kept for existing imports.
+MASK_FRAME_TIME_KEY = FRAME_TIME_KEY
+MASK_FRAME_Z_KEY = FRAME_Z_KEY
 
 
 class CanvasMode(enum.Enum):
@@ -55,6 +63,7 @@ class Canvas(QtWidgets.QWidget):
     zoomRequest = QtCore.pyqtSignal(int, QPointF)
     scrollRequest = QtCore.pyqtSignal(int, int)
     newShape = QtCore.pyqtSignal()
+    pointMaskRequested = QtCore.pyqtSignal(QPointF)
     selectionChanged = QtCore.pyqtSignal(list)
     shapeMoved = QtCore.pyqtSignal()
     drawingPolygon = QtCore.pyqtSignal(bool)
@@ -78,7 +87,7 @@ class Canvas(QtWidgets.QWidget):
     _is_dragging_enabled: bool
 
     _osam_session_model_name: str = "sam2:latest"
-    _osam_session: OsamSession | None
+    _osam_session: OsamSession | MicroSamSession | None
 
     def __init__(self, *args, **kwargs):
         self.epsilon: float = kwargs.pop("epsilon", 10.0)
@@ -99,6 +108,7 @@ class Canvas(QtWidgets.QWidget):
                 "linestrip": False,
                 "ai_polygon": False,
                 "ai_mask": False,
+                "point_mask": True,
             },
         )
         super().__init__(*args, **kwargs)
@@ -153,6 +163,7 @@ class Canvas(QtWidgets.QWidget):
             "linestrip",
             "ai_polygon",
             "ai_mask",
+            "point_mask",
         ]:
             raise ValueError(f"Unsupported createMode: {value}")
         self._createMode = value
@@ -160,19 +171,26 @@ class Canvas(QtWidgets.QWidget):
     def set_ai_model_name(self, model_name: str) -> None:
         self._osam_session_model_name = model_name
 
-    def _get_osam_session(self) -> OsamSession:
+    def _get_osam_session(self) -> OsamSession | MicroSamSession:
         if (
             self._osam_session is None
             or self._osam_session.model_name != self._osam_session_model_name
         ):
-            self._osam_session = OsamSession(model_name=self._osam_session_model_name)
+            if self._osam_session_model_name.startswith("microsam:"):
+                self._osam_session = MicroSamSession(
+                    model_name=self._osam_session_model_name
+                )
+            else:
+                self._osam_session = OsamSession(
+                    model_name=self._osam_session_model_name
+                )
         return self._osam_session
 
     def _update_shape_with_ai(
         self, points: list[QPointF], point_labels: list[int], shape: Shape
     ) -> None:
         image: np.ndarray = labelme.utils.img_qt_to_arr(img_qt=self.pixmap.toImage())
-        response: osam.types.GenerateResponse = self._get_osam_session().run(
+        response = self._get_osam_session().run(
             image=imgviz.asrgb(image),
             image_id=str(self._pixmap_hash),
             points=np.array([[p.x(), p.y()] for p in points]),
@@ -233,7 +251,28 @@ class Canvas(QtWidgets.QWidget):
         self._update_status()
 
     def isVisible(self, shape: Shape) -> bool:  # type: ignore[override]
-        return self.visible.get(shape, True)
+        return self.visible.get(shape, True) and self._is_shape_in_current_frame(shape)
+
+    def _is_shape_in_current_frame(self, shape: Shape) -> bool:
+        if not self._filter_masks_by_frame:
+            return True
+
+        shape_time_index = shape.other_data.get(FRAME_TIME_KEY)
+        shape_z_index = shape.other_data.get(FRAME_Z_KEY)
+        if not isinstance(shape_time_index, int) or not isinstance(shape_z_index, int):
+            # Backward compatibility for old annotations that do not have frame metadata.
+            return True
+
+        return (
+            shape_time_index == self._current_time_index
+            and shape_z_index == self._current_z_index
+        )
+
+    def setFrameContext(self, time_index: int, z_index: int, enabled: bool) -> None:
+        self._current_time_index = time_index
+        self._current_z_index = z_index
+        self._filter_masks_by_frame = enabled
+        self.update()
 
     def drawing(self) -> bool:
         return self.mode == CanvasMode.CREATE
@@ -300,6 +339,8 @@ class Canvas(QtWidgets.QWidget):
             return self.tr(
                 "Click points to include or Shift+Click to exclude for ai_polygon"
             )
+        if self.createMode == "point_mask":
+            return self.tr("Click on the image to flood-fill from that pixel")
         if self.createMode == "ai_mask":
             return self.tr(
                 "Click points to include or Shift+Click to exclude for ai_mask"
@@ -547,6 +588,11 @@ class Canvas(QtWidgets.QWidget):
                         if a0.modifiers() & Qt.ControlModifier:
                             self.finalise()
                 elif not self.outOfPixmap(pos):
+                    # Point-Mask: emit signal and let the app do the flood fill.
+                    if self.createMode == "point_mask":
+                        self.pointMaskRequested.emit(pos)
+                        return
+
                     if self.createMode in ["ai_polygon", "ai_mask"]:
                         if not download_ai_model(
                             model_name=self._osam_session_model_name, parent=self
@@ -915,6 +961,15 @@ class Canvas(QtWidgets.QWidget):
         w, h = self.pixmap.width(), self.pixmap.height()
         return not (0 <= p.x() <= w and 0 <= p.y() <= h)
 
+    def finalize_from_external(self, shape: Shape) -> None:
+        """Add a fully-built shape (created outside the canvas) and emit newShape."""
+        shape.close()
+        self.shapes.append(shape)
+        self.storeShapes()
+        self.setHiding(False)
+        self.newShape.emit()
+        self.update()
+
     def finalise(self):
         assert self.current
         if self.createMode in ["ai_polygon", "ai_mask"]:
@@ -1145,6 +1200,9 @@ class Canvas(QtWidgets.QWidget):
         self.restoreCursor()
         self.pixmap = QtGui.QPixmap()
         self._pixmap_hash = None
+        self._current_time_index = 0
+        self._current_z_index = 0
+        self._filter_masks_by_frame = False
         self.shapes = []
         self.shapesBackups = []
         self.movingShape = False
@@ -1161,7 +1219,7 @@ class Canvas(QtWidgets.QWidget):
 
 
 def _update_shape_with_ai_response(
-    response: osam.types.GenerateResponse,
+    response: osam.types.GenerateResponse | object,
     shape: Shape,
     createMode: Literal["ai_polygon", "ai_mask"],
 ) -> None:

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Flood-fill from point icon: crosshair dot + filled region outline -->
+  <!-- Filled blob representing the segmented region -->
+  <ellipse cx="128" cy="140" rx="80" ry="70" fill="none" stroke="currentColor" stroke-width="16" stroke-dasharray="24 10"/>
+  <!-- Crosshair lines -->
+  <line x1="128" y1="32" x2="128" y2="80"  stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+  <line x1="128" y1="176" x2="128" y2="224" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+  <line x1="32"  y1="140" x2="80"  y2="140" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+  <line x1="176" y1="140" x2="224" y2="140" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+  <!-- Seed point -->
+  <circle cx="128" cy="140" r="16" fill="currentColor"/>
+</svg>

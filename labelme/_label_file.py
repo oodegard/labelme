@@ -40,6 +40,13 @@ class ShapeDict(TypedDict):
     other_data: dict
 
 
+class ImageStackInfoDict(TypedDict):
+    size_t: int
+    size_z: int
+    size_c: int
+    channel_names: list[str]
+
+
 def _load_shape_json_obj(shape_json_obj: dict) -> ShapeDict:
     SHAPE_KEYS: set[str] = {
         "label",
@@ -147,12 +154,52 @@ class LabelFile:
         self.filename: str | None = filename
 
     @staticmethod
-    def load_image_file(filename):
+    def get_image_stack_info(filename: str) -> ImageStackInfoDict | None:
+        ext = osp.splitext(filename)[1].lower()
+        if ext not in BIOIO_IMAGE_SUFFIXES:
+            return None
+
+        from labelme._bioio_file_reader import get_bioio_stack_info
+
+        info = get_bioio_stack_info(filename)
+        return ImageStackInfoDict(
+            size_t=int(info["size_t"]),
+            size_z=int(info["size_z"]),
+            size_c=int(info["size_c"]),
+            channel_names=list(info["channel_names"]),
+        )
+
+    @staticmethod
+    def load_image_file(
+        filename,
+        t_index: int = 0,
+        z_index: int = 0,
+        channel_indices: list[int] | None = None,
+    ):
         t0 = time.time()
+        ext = osp.splitext(filename)[1].lower()
+
+        if ext in BIOIO_IMAGE_SUFFIXES:
+            from labelme._bioio_file_reader import render_bioio_composite_png
+
+            composite_png = render_bioio_composite_png(
+                filename,
+                t_index=t_index,
+                z_index=z_index,
+                channel_indices=channel_indices,
+            )
+            with open(composite_png, "rb") as f:
+                imageData = f.read()
+            logger.debug(
+                "Loaded bioio composite: {!r} in {:.0f}ms",
+                composite_png,
+                (time.time() - t0) * 1000,
+            )
+            return imageData
+
         image_pil = _imread(filename=filename)
 
         oriented: PIL.Image.Image = utils.apply_exif_orientation(image_pil)
-        ext = osp.splitext(filename)[1].lower()
         if oriented is image_pil and ext in (".jpg", ".jpeg", ".png"):
             # no encoding needed
             with open(filename, "rb") as f:
@@ -282,9 +329,24 @@ class LabelFile:
 
 _DISPLAYABLE_MODES = {"1", "L", "P", "RGB", "RGBA", "LA", "PA"}
 
+# Extensions handled by _bioio_file_reader (formats PIL cannot open natively).
+# Exposed publicly so app.py can include them in file-open dialogs and dir scans.
+BIOIO_IMAGE_SUFFIXES: frozenset[str] = frozenset(
+    {".nd2", ".lif", ".czi", ".dv", ".ims", ".oib", ".oif"}
+)
+
+
+def _imread_bioio(filename: str) -> PIL.Image.Image:
+    from labelme._bioio_file_reader import render_bioio_composite_png
+
+    composite_png = render_bioio_composite_png(filename)
+    return PIL.Image.open(composite_png)
+
 
 def _imread(filename: str) -> PIL.Image.Image:
     ext: str = osp.splitext(filename)[1].lower()
+    if ext in BIOIO_IMAGE_SUFFIXES:
+        return _imread_bioio(filename)
     try:
         image_pil = PIL.Image.open(filename)
         if image_pil.mode not in _DISPLAYABLE_MODES:

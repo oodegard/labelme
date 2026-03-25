@@ -35,8 +35,39 @@ dependencies = [
   "pyyaml",
   "scikit-image",
   "tifffile",
+
+	"jdk4py>=21.0.8.0",
+  "scyjava>=1.12.4",
+	"bioio",
+	"bioio-bioformats",
+	"bioio-ome-tiff",
+	"bioio-tifffile",
+	"bioio-nd2",
+	"bioio_lif",
+	"bioio_czi",
+	"bioio_dv",
+
+  "micro-sam",
+  "segment-anything",
+  "torch",
+  "torchvision",
+  "xxhash",
 ]
 dynamic = ["readme", "version"]
+
+[tool.uv.sources]
+micro-sam = { git = "https://github.com/computational-cell-analytics/micro-sam.git" }
+torch = [
+  { index = "pytorch-cuda", marker = "sys_platform != 'darwin'" },
+]
+torchvision = [
+  { index = "pytorch-cuda", marker = "sys_platform != 'darwin'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
 
 [tool.hatch.metadata.hooks.fancy-pypi-readme]
 content-type = "text/markdown"

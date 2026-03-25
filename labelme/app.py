@@ -32,6 +32,8 @@ from labelme import __appname__
 from labelme import __version__
 from labelme._automation import bbox_from_text
 from labelme._automation._osam_session import OsamSession
+from labelme._label_file import BIOIO_IMAGE_SUFFIXES
+from labelme._label_file import ImageStackInfoDict
 from labelme._label_file import LabelFile
 from labelme._label_file import LabelFileError
 from labelme._label_file import ShapeDict
@@ -39,6 +41,7 @@ from labelme.config import load_config
 from labelme.shape import Shape
 from labelme.widgets import AiAssistedAnnotationWidget
 from labelme.widgets import AiTextToAnnotationWidget
+from labelme.widgets import PointMaskWidget
 from labelme.widgets import BrightnessContrastDialog
 from labelme.widgets import Canvas
 from labelme.widgets import FileDialogPreview
@@ -50,6 +53,8 @@ from labelme.widgets import ToolBar
 from labelme.widgets import UniqueLabelQListWidget
 from labelme.widgets import ZoomWidget
 from labelme.widgets import download_ai_model
+from labelme.widgets.canvas import FRAME_TIME_KEY
+from labelme.widgets.canvas import FRAME_Z_KEY
 
 from . import utils
 
@@ -89,6 +94,18 @@ class _CanvasWidgets(NamedTuple):
     canvas: Canvas
     zoom_widget: ZoomWidget
     scroll_bars: dict[Qt.Orientation, QtWidgets.QScrollBar]
+    time_reverse_button: QtWidgets.QPushButton
+    time_play_button: QtWidgets.QPushButton
+    time_next_button: QtWidgets.QPushButton
+    z_reverse_button: QtWidgets.QPushButton
+    z_play_button: QtWidgets.QPushButton
+    z_next_button: QtWidgets.QPushButton
+    time_slider: QtWidgets.QSlider
+    z_slider: QtWidgets.QSlider
+    time_label: QtWidgets.QLabel
+    z_label: QtWidgets.QLabel
+    time_row: QtWidgets.QWidget
+    z_row: QtWidgets.QWidget
 
 
 class _DockWidgets(NamedTuple):
@@ -98,8 +115,10 @@ class _DockWidgets(NamedTuple):
     label_list: LabelListWidget
     label_dock: QtWidgets.QDockWidget
     unique_label_list: UniqueLabelQListWidget
+    channel_dock: QtWidgets.QDockWidget
     file_dock: QtWidgets.QDockWidget
     file_search: QtWidgets.QLineEdit
+    channel_list: QtWidgets.QListWidget
     file_list: QtWidgets.QListWidget
 
 
@@ -132,6 +151,7 @@ class _Actions(NamedTuple):
     create_line_strip_mode: QtWidgets.QAction
     create_ai_polygon_mode: QtWidgets.QAction
     create_ai_mask_mode: QtWidgets.QAction
+    create_point_mask_mode: QtWidgets.QAction
     open_next_img: QtWidgets.QAction
     open_prev_img: QtWidgets.QAction
     keep_prev_scale: QtWidgets.QAction
@@ -177,12 +197,20 @@ class MainWindow(QtWidgets.QMainWindow):
     _canvas_widgets: _CanvasWidgets
     _status_bar: _StatusBarWidgets
     _docks: _DockWidgets
+    _image_stack_info: ImageStackInfoDict | None
+    _stack_time_index: int
+    _stack_z_index: int
+    _stack_channel_indices: list[int]
+    _updating_channel_list: bool
+    _time_play_timer: QtCore.QTimer
+    _z_play_timer: QtCore.QTimer
     _actions: _Actions
     _menus: _Menus
     _scalers: dict[_ZoomMode, Callable[[], float]]
     _label_dialog: LabelDialog
     _ai_annotation: AiAssistedAnnotationWidget
     _ai_text: AiTextToAnnotationWidget
+    _point_mask_widget: PointMaskWidget
 
     _output_dir: str | None
     _filename: str | None
@@ -267,6 +295,9 @@ class MainWindow(QtWidgets.QMainWindow):
             on_submit=self._submit_ai_prompt, parent=self
         )
         self._ai_text.setEnabled(False)
+
+        self._point_mask_widget = PointMaskWidget(parent=self)
+        self._point_mask_widget.setEnabled(False)
 
         self._setup_toolbars()
 
@@ -519,6 +550,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tr("Start drawing ai_polygon. Ctrl+LeftClick ends creation."),
             enabled=False,
         )
+        create_point_mask_mode = action(
+            self.tr("Create Point-Mask"),
+            lambda: self._switch_canvas_mode(edit=False, createMode="point_mask"),
+            None,
+            "point-mask.svg",
+            self.tr("Click on the image to flood-fill a mask from that pixel"),
+            enabled=False,
+        )
         create_ai_mask_mode = action(
             self.tr("Create AI-Mask"),
             lambda: self._switch_canvas_mode(edit=False, createMode="ai_mask"),
@@ -676,6 +715,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("line", create_line_mode),
             ("linestrip", create_line_strip_mode),
             ("ai_polygon", create_ai_polygon_mode),
+            ("point_mask", create_point_mask_mode),
             ("ai_mask", create_ai_mask_mode),
         ]
         zoom = (
@@ -695,6 +735,7 @@ class MainWindow(QtWidgets.QMainWindow):
             create_point_mode,
             create_line_strip_mode,
             create_ai_polygon_mode,
+            create_point_mask_mode,
             create_ai_mask_mode,
             brightness_contrast,
         )
@@ -753,6 +794,7 @@ class MainWindow(QtWidgets.QMainWindow):
             create_point_mode=create_point_mode,
             create_line_strip_mode=create_line_strip_mode,
             create_ai_polygon_mode=create_ai_polygon_mode,
+            create_point_mask_mode=create_point_mask_mode,
             create_ai_mask_mode=create_ai_mask_mode,
             open_next_img=open_next_img,
             open_prev_img=open_prev_img,
@@ -895,6 +937,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ai_prompt_action = QtWidgets.QWidgetAction(self)
         ai_prompt_action.setDefaultWidget(self._ai_text)
 
+        point_mask_action = QtWidgets.QWidgetAction(self)
+        point_mask_action.setDefaultWidget(self._point_mask_widget)
+
         self.addToolBar(
             Qt.TopToolBarArea,
             ToolBar(
@@ -917,6 +962,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._actions.zoom_widget_action,
                     None,
                     select_ai_model,
+                    None,
+                    point_mask_action,
                     None,
                     ai_prompt_action,
                 ],
@@ -947,6 +994,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._image_path = None
         self._max_recent = 7
         self._other_data = None
+        self._image_stack_info = None
+        self._stack_time_index = 0
+        self._stack_z_index = 0
+        self._stack_channel_indices = []
+        self._updating_channel_list = False
         self._zoom_values = {}
         self._brightness_contrast_values = {}
         self._scroll_values = {
@@ -1025,16 +1077,107 @@ class MainWindow(QtWidgets.QMainWindow):
         canvas.scrollRequest.connect(self.scrollRequest)
 
         canvas.newShape.connect(self.newShape)
+        canvas.pointMaskRequested.connect(self._on_point_mask_requested)
         canvas.shapeMoved.connect(self.setDirty)
         canvas.selectionChanged.connect(self.shapeSelectionChanged)
         canvas.drawingPolygon.connect(self.toggleDrawingSensitive)
 
-        self.setCentralWidget(scroll_area)
+        time_slider = QtWidgets.QSlider(Qt.Horizontal)
+        time_slider.setRange(0, 0)
+        time_slider.setEnabled(False)
+        time_slider.valueChanged.connect(self._on_stack_time_changed)
+
+        time_reverse_button = QtWidgets.QPushButton(self.tr("Reverse"))
+        time_reverse_button.clicked.connect(self._on_stack_time_reverse)
+        time_reverse_button.setEnabled(False)
+
+        time_play_button = QtWidgets.QPushButton(self.tr("Play"))
+        time_play_button.clicked.connect(self._toggle_stack_time_play)
+        time_play_button.setEnabled(False)
+
+        time_next_button = QtWidgets.QPushButton(self.tr("Next"))
+        time_next_button.clicked.connect(self._on_stack_time_next)
+        time_next_button.setEnabled(False)
+
+        z_slider = QtWidgets.QSlider(Qt.Horizontal)
+        z_slider.setRange(0, 0)
+        z_slider.setEnabled(False)
+        z_slider.valueChanged.connect(self._on_stack_z_changed)
+
+        z_reverse_button = QtWidgets.QPushButton(self.tr("Reverse"))
+        z_reverse_button.clicked.connect(self._on_stack_z_reverse)
+        z_reverse_button.setEnabled(False)
+
+        z_play_button = QtWidgets.QPushButton(self.tr("Play"))
+        z_play_button.clicked.connect(self._toggle_stack_z_play)
+        z_play_button.setEnabled(False)
+
+        z_next_button = QtWidgets.QPushButton(self.tr("Next"))
+        z_next_button.clicked.connect(self._on_stack_z_next)
+        z_next_button.setEnabled(False)
+
+        self._time_play_timer = QtCore.QTimer(self)
+        self._time_play_timer.setInterval(200)
+        self._time_play_timer.timeout.connect(self._advance_stack_time)
+
+        self._z_play_timer = QtCore.QTimer(self)
+        self._z_play_timer.setInterval(200)
+        self._z_play_timer.timeout.connect(self._advance_stack_z)
+
+        time_label = QtWidgets.QLabel(self.tr("Time: 1/1"))
+        z_label = QtWidgets.QLabel(self.tr("Z: 1/1"))
+
+        time_row = QtWidgets.QWidget()
+        time_row_layout = QtWidgets.QHBoxLayout()
+        time_row_layout.setContentsMargins(8, 0, 8, 0)
+        time_row_layout.setSpacing(8)
+        time_row_layout.addWidget(time_reverse_button)
+        time_row_layout.addWidget(time_play_button)
+        time_row_layout.addWidget(time_next_button)
+        time_row_layout.addWidget(time_label)
+        time_row_layout.addWidget(time_slider)
+        time_row.setLayout(time_row_layout)
+
+        z_row = QtWidgets.QWidget()
+        z_row_layout = QtWidgets.QHBoxLayout()
+        z_row_layout.setContentsMargins(8, 0, 8, 8)
+        z_row_layout.setSpacing(8)
+        z_row_layout.addWidget(z_reverse_button)
+        z_row_layout.addWidget(z_play_button)
+        z_row_layout.addWidget(z_next_button)
+        z_row_layout.addWidget(z_label)
+        z_row_layout.addWidget(z_slider)
+        z_row.setLayout(z_row_layout)
+
+        container = QtWidgets.QWidget()
+        container_layout = QtWidgets.QVBoxLayout()
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        container_layout.addWidget(scroll_area, 1)
+        container_layout.addWidget(time_row)
+        container_layout.addWidget(z_row)
+        container.setLayout(container_layout)
+        self.setCentralWidget(container)
+
+        time_row.setVisible(False)
+        z_row.setVisible(False)
 
         return _CanvasWidgets(
             canvas=canvas,
             zoom_widget=zoom_widget,
             scroll_bars=scroll_bars,
+            time_reverse_button=time_reverse_button,
+            time_play_button=time_play_button,
+            time_next_button=time_next_button,
+            z_reverse_button=z_reverse_button,
+            z_play_button=z_play_button,
+            z_next_button=z_next_button,
+            time_slider=time_slider,
+            z_slider=z_slider,
+            time_label=time_label,
+            z_label=z_label,
+            time_row=time_row,
+            z_row=z_row,
         )
 
     def _setup_dock_widgets(self) -> _DockWidgets:
@@ -1077,6 +1220,14 @@ class MainWindow(QtWidgets.QMainWindow):
         file_search = QtWidgets.QLineEdit()
         file_search.setPlaceholderText(self.tr("Search Filename"))
         file_search.textChanged.connect(self.fileSearchChanged)
+        channel_list = QtWidgets.QListWidget()
+        channel_list.itemChanged.connect(self._on_channel_item_changed)
+
+        channel = QtWidgets.QDockWidget(self.tr("Channels"), self)
+        channel.setObjectName("Channels")
+        channel.setWidget(channel_list)
+        channel.setVisible(False)
+
         file_list = QtWidgets.QListWidget()
         file_list.itemSelectionChanged.connect(self.fileSelectionChanged)
         file_list_layout = QtWidgets.QVBoxLayout()
@@ -1108,6 +1259,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 dock_widget.setVisible(False)
             self.addDockWidget(Qt.RightDockWidgetArea, dock_widget)
 
+        file_dock_cfg = self._config["file_dock"]
+        channel_features = QtWidgets.QDockWidget.DockWidgetFeatures()
+        if file_dock_cfg["closable"]:
+            channel_features = channel_features | QtWidgets.QDockWidget.DockWidgetClosable
+        if file_dock_cfg["floatable"]:
+            channel_features = channel_features | QtWidgets.QDockWidget.DockWidgetFloatable
+        if file_dock_cfg["movable"]:
+            channel_features = channel_features | QtWidgets.QDockWidget.DockWidgetMovable
+        channel.setFeatures(channel_features)
+        self.addDockWidget(Qt.RightDockWidgetArea, channel)
+        self.splitDockWidget(channel, file, Qt.Vertical)
+
         return _DockWidgets(
             flag_dock=flag,
             flag_list=flag_list,
@@ -1115,8 +1278,10 @@ class MainWindow(QtWidgets.QMainWindow):
             label_list=label_list,
             label_dock=label,
             unique_label_list=unique_label_list,
+            channel_dock=channel,
             file_dock=file,
             file_search=file_search,
+            channel_list=channel_list,
             file_list=file_list,
         )
 
@@ -1157,6 +1322,228 @@ class MainWindow(QtWidgets.QMainWindow):
         return menu
 
     # Support Functions
+
+    def _set_stack_controls_visible(self, visible: bool) -> None:
+        self._canvas_widgets.time_row.setVisible(visible)
+        self._canvas_widgets.z_row.setVisible(visible)
+        self._docks.channel_dock.setVisible(visible)
+
+    def _set_time_playing(self, playing: bool) -> None:
+        if playing:
+            self._time_play_timer.start()
+            self._canvas_widgets.time_play_button.setText(self.tr("Stop"))
+        else:
+            self._time_play_timer.stop()
+            self._canvas_widgets.time_play_button.setText(self.tr("Play"))
+
+    def _set_z_playing(self, playing: bool) -> None:
+        if playing:
+            self._z_play_timer.start()
+            self._canvas_widgets.z_play_button.setText(self.tr("Stop"))
+        else:
+            self._z_play_timer.stop()
+            self._canvas_widgets.z_play_button.setText(self.tr("Play"))
+
+    def _advance_stack_time(self) -> None:
+        if self._image_stack_info is None:
+            return
+        size_t = self._image_stack_info["size_t"]
+        if size_t <= 1:
+            return
+        next_idx = (self._stack_time_index + 1) % size_t
+        self._canvas_widgets.time_slider.setValue(next_idx)
+
+    def _advance_stack_z(self) -> None:
+        if self._image_stack_info is None:
+            return
+        size_z = self._image_stack_info["size_z"]
+        if size_z <= 1:
+            return
+        next_idx = (self._stack_z_index + 1) % size_z
+        self._canvas_widgets.z_slider.setValue(next_idx)
+
+    def _on_stack_time_reverse(self) -> None:
+        if self._image_stack_info is None:
+            return
+        size_t = self._image_stack_info["size_t"]
+        if size_t <= 1:
+            return
+        prev_idx = (self._stack_time_index - 1) % size_t
+        self._canvas_widgets.time_slider.setValue(prev_idx)
+
+    def _on_stack_time_next(self) -> None:
+        self._advance_stack_time()
+
+    def _toggle_stack_time_play(self) -> None:
+        self._set_time_playing(not self._time_play_timer.isActive())
+
+    def _on_stack_z_reverse(self) -> None:
+        if self._image_stack_info is None:
+            return
+        size_z = self._image_stack_info["size_z"]
+        if size_z <= 1:
+            return
+        prev_idx = (self._stack_z_index - 1) % size_z
+        self._canvas_widgets.z_slider.setValue(prev_idx)
+
+    def _on_stack_z_next(self) -> None:
+        self._advance_stack_z()
+
+    def _toggle_stack_z_play(self) -> None:
+        self._set_z_playing(not self._z_play_timer.isActive())
+
+    def _update_stack_slider_labels(self) -> None:
+        if self._image_stack_info is None:
+            self._canvas_widgets.time_label.setText(self.tr("Time: 1/1"))
+            self._canvas_widgets.z_label.setText(self.tr("Z: 1/1"))
+            return
+        self._canvas_widgets.time_label.setText(
+            self.tr("Time: {}/{}").format(
+                self._stack_time_index + 1,
+                self._image_stack_info["size_t"],
+            )
+        )
+        self._canvas_widgets.z_label.setText(
+            self.tr("Z: {}/{}").format(
+                self._stack_z_index + 1,
+                self._image_stack_info["size_z"],
+            )
+        )
+
+    def _reset_stack_controls(self) -> None:
+        self._set_time_playing(False)
+        self._set_z_playing(False)
+        self._image_stack_info = None
+        self._stack_time_index = 0
+        self._stack_z_index = 0
+        self._stack_channel_indices = []
+        self._updating_channel_list = True
+        self._docks.channel_list.clear()
+        self._updating_channel_list = False
+        self._canvas_widgets.time_slider.blockSignals(True)
+        self._canvas_widgets.z_slider.blockSignals(True)
+        self._canvas_widgets.time_slider.setRange(0, 0)
+        self._canvas_widgets.z_slider.setRange(0, 0)
+        self._canvas_widgets.time_slider.setValue(0)
+        self._canvas_widgets.z_slider.setValue(0)
+        self._canvas_widgets.time_slider.setEnabled(False)
+        self._canvas_widgets.z_slider.setEnabled(False)
+        self._canvas_widgets.time_reverse_button.setEnabled(False)
+        self._canvas_widgets.time_play_button.setEnabled(False)
+        self._canvas_widgets.time_next_button.setEnabled(False)
+        self._canvas_widgets.z_reverse_button.setEnabled(False)
+        self._canvas_widgets.z_play_button.setEnabled(False)
+        self._canvas_widgets.z_next_button.setEnabled(False)
+        self._canvas_widgets.time_slider.blockSignals(False)
+        self._canvas_widgets.z_slider.blockSignals(False)
+        self._update_stack_slider_labels()
+        self._set_stack_controls_visible(False)
+        self._sync_canvas_frame_context()
+
+    def _setup_stack_controls_for_image(self, image_path: str | None) -> None:
+        if not image_path:
+            self._reset_stack_controls()
+            return
+
+        info = LabelFile.get_image_stack_info(image_path)
+        if info is None:
+            self._reset_stack_controls()
+            return
+
+        self._image_stack_info = info
+        self._stack_time_index = 0
+        self._stack_z_index = 0
+        self._stack_channel_indices = list(range(min(info["size_c"], 3)))
+
+        self._canvas_widgets.time_slider.blockSignals(True)
+        self._canvas_widgets.time_slider.setRange(0, max(0, info["size_t"] - 1))
+        self._canvas_widgets.time_slider.setValue(self._stack_time_index)
+        self._canvas_widgets.time_slider.setEnabled(info["size_t"] > 1)
+        self._canvas_widgets.time_reverse_button.setEnabled(info["size_t"] > 1)
+        self._canvas_widgets.time_play_button.setEnabled(info["size_t"] > 1)
+        self._canvas_widgets.time_next_button.setEnabled(info["size_t"] > 1)
+        self._canvas_widgets.time_slider.blockSignals(False)
+
+        self._canvas_widgets.z_slider.blockSignals(True)
+        self._canvas_widgets.z_slider.setRange(0, max(0, info["size_z"] - 1))
+        self._canvas_widgets.z_slider.setValue(self._stack_z_index)
+        self._canvas_widgets.z_slider.setEnabled(info["size_z"] > 1)
+        self._canvas_widgets.z_reverse_button.setEnabled(info["size_z"] > 1)
+        self._canvas_widgets.z_play_button.setEnabled(info["size_z"] > 1)
+        self._canvas_widgets.z_next_button.setEnabled(info["size_z"] > 1)
+        self._canvas_widgets.z_slider.blockSignals(False)
+
+        self._updating_channel_list = True
+        self._docks.channel_list.clear()
+        for channel_idx, channel_name in enumerate(info["channel_names"]):
+            item = QtWidgets.QListWidgetItem(channel_name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Checked
+                if channel_idx in self._stack_channel_indices
+                else Qt.Unchecked
+            )
+            self._docks.channel_list.addItem(item)
+        self._updating_channel_list = False
+
+        self._update_stack_slider_labels()
+        self._set_stack_controls_visible(True)
+        self._sync_canvas_frame_context()
+
+    def _sync_canvas_frame_context(self) -> None:
+        self._canvas_widgets.canvas.setFrameContext(
+            time_index=self._stack_time_index,
+            z_index=self._stack_z_index,
+            enabled=self._image_stack_info is not None,
+        )
+
+    def _set_shape_frame_metadata(self, shape: Shape) -> None:
+        shape.other_data[FRAME_TIME_KEY] = self._stack_time_index
+        shape.other_data[FRAME_Z_KEY] = self._stack_z_index
+
+    def _refresh_stack_image(self) -> None:
+        if self._image_stack_info is None or not self._image_path:
+            return
+
+        self.imageData = LabelFile.load_image_file(
+            self._image_path,
+            t_index=self._stack_time_index,
+            z_index=self._stack_z_index,
+            channel_indices=self._stack_channel_indices,
+        )
+        image = QtGui.QImage.fromData(self.imageData)
+        if image.isNull():
+            logger.warning("stack image is null, cannot refresh view")
+            return
+        self._image = image
+        self._canvas_widgets.canvas.loadPixmap(QtGui.QPixmap.fromImage(image), clear_shapes=False)
+        self._sync_canvas_frame_context()
+        self._paint_canvas()
+
+    def _on_stack_time_changed(self, value: int) -> None:
+        if self._image_stack_info is None or value == self._stack_time_index:
+            return
+        self._stack_time_index = value
+        self._update_stack_slider_labels()
+        self._refresh_stack_image()
+
+    def _on_stack_z_changed(self, value: int) -> None:
+        if self._image_stack_info is None or value == self._stack_z_index:
+            return
+        self._stack_z_index = value
+        self._update_stack_slider_labels()
+        self._refresh_stack_image()
+
+    def _on_channel_item_changed(self, _item: QtWidgets.QListWidgetItem) -> None:
+        if self._updating_channel_list or self._image_stack_info is None:
+            return
+        selected_channels: list[int] = []
+        for idx in range(self._docks.channel_list.count()):
+            item = self._docks.channel_list.item(idx)
+            if item and item.checkState() == Qt.Checked:
+                selected_channels.append(idx)
+        self._stack_channel_indices = selected_channels
+        self._refresh_stack_image()
 
     def noShapes(self) -> bool:
         return not len(self._docks.label_list)
@@ -1228,6 +1615,50 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def show_status_message(self, message: str, delay: int = 500) -> None:
         self.statusBar().showMessage(message, delay)
+
+    def _on_point_mask_requested(self, pos: QtCore.QPointF) -> None:
+        import math
+
+        import numpy as np
+        import skimage.measure
+
+        image = labelme.utils.img_qt_to_arr(img_qt=self._image)
+        if image.ndim == 3:
+            lum = (
+                0.2126 * image[:, :, 0].astype(float)
+                + 0.7152 * image[:, :, 1].astype(float)
+                + 0.0722 * image[:, :, 2].astype(float)
+            )
+        else:
+            lum = image.astype(float)
+        h, w = lum.shape
+        x = int(round(pos.x()))
+        y = int(round(pos.y()))
+        if not (0 <= x < w and 0 <= y < h):
+            return
+        seed_val = lum[y, x]
+        lo = seed_val - self._point_mask_widget.min_value
+        hi = seed_val + self._point_mask_widget.max_value
+        if math.isinf(hi):
+            cond = lum >= lo
+        else:
+            cond = (lum >= lo) & (lum <= hi)
+        labeled = skimage.measure.label(cond, connectivity=1)
+        seed_label = labeled[y, x]
+        if seed_label == 0:
+            return
+        flood_mask = labeled == seed_label
+        rows = np.where(flood_mask.any(axis=1))[0]
+        cols = np.where(flood_mask.any(axis=0))[0]
+        y1, y2 = int(rows[0]), int(rows[-1])
+        x1, x2 = int(cols[0]), int(cols[-1])
+        cropped = flood_mask[y1 : y2 + 1, x1 : x2 + 1]
+        shape = Shape(shape_type="mask")
+        shape.addPoint(QtCore.QPointF(x1, y1))
+        shape.addPoint(QtCore.QPointF(x2, y2))
+        shape.mask = cropped
+        self._set_shape_frame_metadata(shape)
+        self._canvas_widgets.canvas.finalize_from_external(shape)
 
     def _submit_ai_prompt(self, _) -> None:
         if (
@@ -1317,6 +1748,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.imageData = None
         self._label_file = None
         self._other_data = None
+        self._reset_stack_controls()
         self._canvas_widgets.canvas.resetState()
 
     def currentItem(self) -> LabelListWidgetItem | None:
@@ -1372,6 +1804,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._ai_annotation.setEnabled(
             not edit and createMode in ("ai_polygon", "ai_mask")
+        )
+        self._point_mask_widget.setEnabled(
+            not edit and createMode == "point_mask"
         )
 
     def updateFileMenu(self):
@@ -1747,6 +2182,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pasteSelectedShape()
 
     def pasteSelectedShape(self) -> None:
+        for shape in self._copied_shapes:
+            self._set_shape_frame_metadata(shape)
         self._load_shapes(shapes=self._copied_shapes, replace=False)
         self._canvas_widgets.canvas.selectShapes(self._copied_shapes)
         self.setDirty()
@@ -1810,6 +2247,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if text:
             self._docks.label_list.clearSelection()
             shape = self._canvas_widgets.canvas.setLastLabel(text, flags)
+            self._set_shape_frame_metadata(shape)
             shape.group_id = group_id
             shape.description = description
             self.addLabel(shape)
@@ -2019,10 +2457,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._label_file.imagePath,
             )
             self._other_data = self._label_file.otherData
+
+            self._setup_stack_controls_for_image(self._image_path)
+            if self._image_stack_info is not None:
+                try:
+                    self.imageData = LabelFile.load_image_file(
+                        self._image_path,
+                        t_index=self._stack_time_index,
+                        z_index=self._stack_z_index,
+                        channel_indices=self._stack_channel_indices,
+                    )
+                except Exception as e:
+                    self.errorMessage(
+                        self.tr("Error opening file"),
+                        self.tr(
+                            "<p><b>%s</b></p>"
+                            "<p>Make sure <i>%s</i> is a valid image file.</p>"
+                        )
+                        % (e, self._image_path),
+                    )
+                    self.show_status_message(self.tr("Error reading %s") % self._image_path)
+                    return False
         else:
+            self._image_path = filename
+            self._setup_stack_controls_for_image(self._image_path)
             try:
-                self.imageData = LabelFile.load_image_file(filename)
-            except OSError as e:
+                self.imageData = LabelFile.load_image_file(
+                    filename,
+                    t_index=self._stack_time_index,
+                    z_index=self._stack_z_index,
+                    channel_indices=self._stack_channel_indices,
+                )
+            except Exception as e:
                 self.errorMessage(
                     self.tr("Error opening file"),
                     self.tr(
@@ -2033,8 +2499,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 self.show_status_message(self.tr("Error reading %s") % filename)
                 return False
-            if self.imageData:
-                self._image_path = filename
             self._label_file = None
         assert self.imageData is not None
         t0 = time.time()
@@ -2088,6 +2552,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
         self.brightnessContrast(value=False, is_initial_load=True)
         self._paint_canvas()
+
+        if self._image_path and self._image_path not in self.imageList:
+            list_label_file = f"{osp.splitext(self._image_path)[0]}.json"
+            if self._output_dir:
+                list_label_file_without_path = osp.basename(list_label_file)
+                list_label_file = osp.join(self._output_dir, list_label_file_without_path)
+
+            item = QtWidgets.QListWidgetItem(self._image_path)
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            if QtCore.QFile.exists(list_label_file) and LabelFile.is_label_file(
+                list_label_file
+            ):
+                item.setCheckState(Qt.Checked)
+            else:
+                item.setCheckState(Qt.Unchecked)
+            self._docks.file_list.addItem(item)
+
+        if self._image_path in self.imageList:
+            self._docks.file_list.setCurrentRow(self.imageList.index(self._image_path))
+
         self.addRecentFile(self._filename)
         self.toggleActions(True)
         self._canvas_widgets.canvas.setFocus()
@@ -2159,7 +2643,7 @@ class MainWindow(QtWidgets.QMainWindow):
         extensions = [
             f".{fmt.data().decode().lower()}"
             for fmt in QtGui.QImageReader.supportedImageFormats()
-        ]
+        ] + list(BIOIO_IMAGE_SUFFIXES)
         if a0.mimeData().hasUrls():
             items = [i.toLocalFile() for i in a0.mimeData().urls()]
             if any([i.lower().endswith(tuple(extensions)) for i in items]):
@@ -2207,7 +2691,7 @@ class MainWindow(QtWidgets.QMainWindow):
         formats = [
             f"*.{fmt.data().decode()}"
             for fmt in QtGui.QImageReader.supportedImageFormats()
-        ]
+        ] + [f"*{ext}" for ext in sorted(BIOIO_IMAGE_SUFFIXES)]
         filters = self.tr("Image & Label files (%s)") % " ".join(
             formats + [f"*{LabelFile.suffix}"]
         )
@@ -2485,7 +2969,7 @@ class MainWindow(QtWidgets.QMainWindow):
         extensions = [
             f".{fmt.data().decode().lower()}"
             for fmt in QtGui.QImageReader.supportedImageFormats()
-        ]
+        ] + list(BIOIO_IMAGE_SUFFIXES)
 
         self._filename = None
         for file in imageFiles:
@@ -2552,7 +3036,7 @@ def _scan_image_files(root_dir: str) -> list[str]:
     extensions: list[str] = [
         f".{fmt.data().decode().lower()}"
         for fmt in QtGui.QImageReader.supportedImageFormats()
-    ]
+    ] + list(BIOIO_IMAGE_SUFFIXES)
 
     images: list[str] = []
     for root, dirs, files in os.walk(root_dir):

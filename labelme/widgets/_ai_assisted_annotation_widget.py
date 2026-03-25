@@ -18,6 +18,9 @@ class AiAssistedAnnotationWidget(QtWidgets.QWidget):
         ("sam2:small", "Sam2 (speed)"),
         ("sam2:latest", "Sam2 (balanced)"),
         ("sam2:large", "Sam2 (accuracy)"),
+        ("microsam:vit_b_lm", "MicroSam ViT-B LM (microscopy)"),
+        ("microsam:vit_l_lm", "MicroSam ViT-L LM (microscopy, accurate)"),
+        ("microsam:vit_b_em_organelles", "MicroSam ViT-B EM Organelles"),
     ]
 
     _model_combo: QtWidgets.QComboBox
