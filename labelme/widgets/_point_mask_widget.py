@@ -45,14 +45,19 @@ class _InfDoubleSpinBox(QtWidgets.QDoubleSpinBox):
 class PointMaskWidget(QtWidgets.QWidget):
     """Settings panel for the Point-Mask flood-fill tool.
 
-    Shows Min and Max intensity-offset spinboxes.  The flood fill starting from
-    the clicked pixel includes all 4-connected pixels whose intensity lies in
-    [seed_value - min, seed_value + max].  Max supports ∞.
+    The clicked position defines a circular seed region. Mean and standard
+    deviation are computed from that region, then flood-fill includes connected
+    pixels whose intensity is within [mean - lower_sd * sd, mean + upper_sd * sd].
+
+    Lower SD supports ∞, interpreted as "no lower bound" (floor at 0).
     """
 
+    _radius_spin: QtWidgets.QSpinBox
     _lo_spin: _InfDoubleSpinBox
     _hi_spin: _InfDoubleSpinBox
     _body: QtWidgets.QWidget
+
+    pointRadiusChanged = QtCore.pyqtSignal(int)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent=parent)
@@ -71,10 +76,12 @@ class PointMaskWidget(QtWidgets.QWidget):
         info_button = InfoButton(
             tooltip=self.tr(
                 "In 'Point-Mask' mode, click anywhere on the image to\n"
-                "flood-fill from that pixel using 4-connectivity.\n\n"
-                "A pixel is included when its intensity satisfies:\n"
-                "  seed − Min  ≤  pixel  ≤  seed + Max\n\n"
-                "Set Max to ∞ to include all brighter pixels."
+                "flood-fill from that area using 4-connectivity.\n\n"
+                "1. Build a circular seed region around the click.\n"
+                "2. Compute mean and SD from that region.\n"
+                "3. Include connected pixels that satisfy:\n"
+                "   mean − (Lower SD * SD) ≤ pixel ≤ mean + (Upper SD * SD).\n\n"
+                "Set Lower SD to ∞ to allow all darker values (down to 0)."
             )
         )
         header_layout.addWidget(info_button)
@@ -88,21 +95,36 @@ class PointMaskWidget(QtWidgets.QWidget):
         body_layout.setSpacing(4)
         body.setLayout(body_layout)
 
+        self._radius_spin = QtWidgets.QSpinBox()
+        self._radius_spin.setMinimum(1)
+        self._radius_spin.setMaximum(1024)
+        self._radius_spin.setValue(10)
+        self._radius_spin.setSingleStep(1)
+        self._radius_spin.setToolTip(
+            self.tr("Radius in pixels for the circular seed region")
+        )
+        self._radius_spin.valueChanged.connect(self.pointRadiusChanged.emit)
+        body_layout.addRow(self.tr("Point Radius (px)"), self._radius_spin)
+
         self._lo_spin = _InfDoubleSpinBox()
         self._lo_spin.setMinimum(0.0)
-        self._lo_spin.setValue(0.0)
+        self._lo_spin.setDecimals(1)
+        self._lo_spin.setSingleStep(0.5)
+        self._lo_spin.setValue(_InfDoubleSpinBox._INF_VALUE)  # default ∞
         self._lo_spin.setToolTip(
-            self.tr("Lower offset: include pixels with value ≥ seed − Min")
+            self.tr("Lower SD multiplier (∞ = no lower bound; floor is 0)")
         )
-        body_layout.addRow(self.tr("Min"), self._lo_spin)
+        body_layout.addRow(self.tr("Lower SD"), self._lo_spin)
 
         self._hi_spin = _InfDoubleSpinBox()
         self._hi_spin.setMinimum(0.0)
-        self._hi_spin.setValue(_InfDoubleSpinBox._INF_VALUE)  # default ∞
+        self._hi_spin.setDecimals(1)
+        self._hi_spin.setSingleStep(0.5)
+        self._hi_spin.setValue(2.0)
         self._hi_spin.setToolTip(
-            self.tr("Upper offset: include pixels with value ≤ seed + Max  (∞ = no upper limit)")
+            self.tr("Upper SD multiplier (default 2.0)")
         )
-        body_layout.addRow(self.tr("Max"), self._hi_spin)
+        body_layout.addRow(self.tr("Upper SD"), self._hi_spin)
 
         layout.addWidget(body)
         self.setMaximumWidth(200)
@@ -112,13 +134,18 @@ class PointMaskWidget(QtWidgets.QWidget):
     # ------------------------------------------------------------------
 
     @property
-    def min_value(self) -> float:
-        """Lower intensity offset (≥ 0, possibly math.inf)."""
+    def point_radius_px(self) -> int:
+        """Circular seed radius in pixels."""
+        return int(self._radius_spin.value())
+
+    @property
+    def lower_sd(self) -> float:
+        """Lower SD multiplier (≥ 0, possibly math.inf)."""
         return self._lo_spin.real_value
 
     @property
-    def max_value(self) -> float:
-        """Upper intensity offset (≥ 0, possibly math.inf)."""
+    def upper_sd(self) -> float:
+        """Upper SD multiplier (≥ 0, possibly math.inf)."""
         return self._hi_spin.real_value
 
     # ------------------------------------------------------------------

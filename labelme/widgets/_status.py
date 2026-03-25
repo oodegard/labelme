@@ -10,3 +10,6 @@ class StatusStats(QtWidgets.QLabel):
         font.setFamily("monospace")
         font.setStyleHint(QtGui.QFont.Monospace)
         self.setFont(font)
+        
+        # Add padding to create margin from edges
+        self.setStyleSheet("padding: 2px 6px;")

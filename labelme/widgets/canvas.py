@@ -135,6 +135,7 @@ class Canvas(QtWidgets.QWidget):
         self._dragging_start_pos = QPointF()
         self._is_dragging = False
         self._is_dragging_enabled = False
+        self._point_mask_radius_px = 10
         # Menus:
         # 0: right-click without selection and dragging of shapes
         # 1: right-click with selection and dragging of shapes
@@ -878,8 +879,24 @@ class Canvas(QtWidgets.QWidget):
 
         p.scale(1 / self.scale, 1 / self.scale)
 
-        # draw crosshair
+        # Draw point-mask radius preview.
         if (
+            self.createMode == "point_mask"
+            and self.drawing()
+            and self.prevMovePoint is not None
+            and not self.outOfPixmap(self.prevMovePoint)
+        ):
+            center_x = int(self.prevMovePoint.x() * self.scale)
+            center_y = int(self.prevMovePoint.y() * self.scale)
+            radius = max(1, int(round(self._point_mask_radius_px * self.scale)))
+            p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(QPoint(center_x, center_y), radius, radius)
+            p.setPen(QtGui.QPen(QtGui.QColor(0, 255, 255), 1))
+            p.drawEllipse(QPoint(center_x, center_y), radius, radius)
+
+        # draw crosshair
+        elif (
             self._crosshair[self._createMode]
             and self.drawing()
             and self.prevMovePoint is not None
@@ -945,6 +962,10 @@ class Canvas(QtWidgets.QWidget):
         drawing_shape.selected = self.fillDrawing()
         drawing_shape.paint(p)
         p.end()
+
+    def set_point_mask_radius(self, radius_px: int) -> None:
+        self._point_mask_radius_px = max(1, int(radius_px))
+        self.update()
 
     def transformPos(self, point: QPointF) -> QPointF:
         """Convert from widget-logical coordinates to painter-logical ones."""

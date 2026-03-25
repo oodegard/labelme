@@ -298,6 +298,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._point_mask_widget = PointMaskWidget(parent=self)
         self._point_mask_widget.setEnabled(False)
+        self._point_mask_widget.pointRadiusChanged.connect(
+            self._canvas_widgets.canvas.set_point_mask_radius
+        )
+        self._canvas_widgets.canvas.set_point_mask_radius(
+            self._point_mask_widget.point_radius_px
+        )
 
         self._setup_toolbars()
 
@@ -1623,8 +1629,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         import numpy as np
         import skimage.measure
+        from labelme.utils import img_qt_to_arr
 
-        image = labelme.utils.img_qt_to_arr(img_qt=self._image)
+        image = img_qt_to_arr(img_qt=self._image)
         if image.ndim == 3:
             lum = (
                 0.2126 * image[:, :, 0].astype(float)
@@ -1638,20 +1645,58 @@ class MainWindow(QtWidgets.QMainWindow):
         y = int(round(pos.y()))
         if not (0 <= x < w and 0 <= y < h):
             return
-        seed_val = lum[y, x]
-        lo = seed_val - self._point_mask_widget.min_value
-        hi = seed_val + self._point_mask_widget.max_value
+
+        radius = self._point_mask_widget.point_radius_px
+        y_min = max(0, y - radius)
+        y_max = min(h - 1, y + radius)
+        x_min = max(0, x - radius)
+        x_max = min(w - 1, x + radius)
+
+        yy, xx = np.ogrid[y_min : y_max + 1, x_min : x_max + 1]
+        seed_disk = ((yy - y) ** 2 + (xx - x) ** 2) <= radius**2
+        if not np.any(seed_disk):
+            return
+
+        seed_values = lum[y_min : y_max + 1, x_min : x_max + 1][seed_disk]
+        if seed_values.size == 0:
+            return
+
+        seed_mean = float(np.nanmean(seed_values))
+        seed_std = float(np.nanstd(seed_values))
+        if np.isnan(seed_mean) or np.isnan(seed_std):
+            return
+
+        lower_sd = self._point_mask_widget.lower_sd
+        upper_sd = self._point_mask_widget.upper_sd
+
+        # Intensities are non-negative; treat lower=∞ as an open lower bound.
+        lo = 0.0 if math.isinf(lower_sd) else seed_mean - lower_sd * seed_std
+        lo = max(0.0, lo)
+        hi = math.inf if math.isinf(upper_sd) else seed_mean + upper_sd * seed_std
+
         if math.isinf(hi):
             cond = lum >= lo
         else:
             cond = (lum >= lo) & (lum <= hi)
+
         labeled = skimage.measure.label(cond, connectivity=1)
-        seed_label = labeled[y, x]
+
+        seed_labels = labeled[y_min : y_max + 1, x_min : x_max + 1][seed_disk]
+        seed_labels = seed_labels[seed_labels != 0]
+        if seed_labels.size > 0:
+            seed_label = int(np.bincount(seed_labels).argmax())
+        else:
+            seed_label = int(labeled[y, x])
+
         if seed_label == 0:
             return
         flood_mask = labeled == seed_label
+
         rows = np.where(flood_mask.any(axis=1))[0]
         cols = np.where(flood_mask.any(axis=0))[0]
+        if rows.size == 0 or cols.size == 0:
+            return
+
         y1, y2 = int(rows[0]), int(rows[-1])
         x1, x2 = int(cols[0]), int(cols[-1])
         cropped = flood_mask[y1 : y2 + 1, x1 : x2 + 1]
@@ -3032,23 +3077,33 @@ class MainWindow(QtWidgets.QMainWindow):
         stats.append(f"mode={self._canvas_widgets.canvas.mode.name}")
         stats.append(f"x={mouse_pos.x():6.1f}, y={mouse_pos.y():6.1f}")
         
-        # Add pixel intensity value if image data is available
-        if hasattr(self, 'imageData') and self.imageData is not None:
-            import numpy as np
-            x_pixel = int(mouse_pos.x())
-            y_pixel = int(mouse_pos.y())
+        # Add pixel intensity values (RGB) from the displayed image
+        try:
+            from labelme.utils import img_qt_to_arr
             
-            # Check if coordinates are within image bounds
-            if 0 <= y_pixel < self.imageData.shape[0] and 0 <= x_pixel < self.imageData.shape[1]:
-                pixel_val = self.imageData[y_pixel, x_pixel]
+            canvas = self._canvas_widgets.canvas
+            if canvas.pixmap is not None:
+                x_pixel = int(mouse_pos.x())
+                y_pixel = int(mouse_pos.y())
                 
-                # Handle multi-channel images - average or use first channel
-                if isinstance(pixel_val, np.ndarray) and pixel_val.ndim > 0:
-                    pixel_val = int(np.mean(pixel_val))
-                else:
-                    pixel_val = int(pixel_val)
+                # Convert pixmap to numpy array
+                img_array = img_qt_to_arr(canvas.pixmap.toImage())
                 
-                stats.append(f"v={pixel_val}")
+                # Check if coordinates are within image bounds
+                if 0 <= y_pixel < img_array.shape[0] and 0 <= x_pixel < img_array.shape[1]:
+                    pixel = img_array[y_pixel, x_pixel]
+                    
+                    # Extract RGB values (first 3 channels)
+                    if len(pixel) >= 3:
+                        r, g, b = pixel[:3]
+                        stats.append(f"RGB=({int(r)},{int(g)},{int(b)})")
+                    elif len(pixel) == 1:
+                        # Grayscale image
+                        v = pixel[0]
+                        stats.append(f"v={int(v)}")
+        except Exception:
+            # Silently ignore errors (e.g., pixmap conversion issues)
+            pass
         
         self._status_bar.stats.setText(" | ".join(stats))
 
